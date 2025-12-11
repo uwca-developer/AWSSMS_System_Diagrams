@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMS Campaign Architecture - United Ways of California</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f7fa;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #005191;
+            margin-top: 0;
+            font-size: 28px;
+            border-bottom: 3px solid #539ED0;
+            padding-bottom: 15px;
+        }
+        h2 {
+            color: #005191;
+            font-size: 20px;
+            margin-top: 40px;
+            margin-bottom: 20px;
+        }
+        .diagram-wrapper {
+            background: white;
+            padding: 20px;
+            border-radius: 4px;
+            margin: 20px 0;
+            overflow-x: auto;
+        }
+        .key-features {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 4px;
+            margin: 20px 0;
+        }
+        .key-features h3 {
+            color: #005191;
+            margin-top: 0;
+            font-size: 18px;
+        }
+        .key-features ul {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        .key-features li {
+            margin: 8px 0;
+            line-height: 1.6;
+        }
+        .note {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+        .note strong {
+            color: #856404;
+        }
+        @media print {
+            body {
+                background: white;
+            }
+            .container {
+                box-shadow: none;
+                padding: 0;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SMS Campaign Architecture</h1>
+        <p style="color: #666; font-size: 14px; margin-top: -10px;">United Ways of California - Switcher-Based Campaign System</p>
+
+        <h2>System Overview</h2>
+        <div class="diagram-wrapper">
+            <div class="mermaid">
+graph TB
+    subgraph "User Interface"
+        UI[Campaign UI<br/>Schedule & Configure]
+    end
+
+    subgraph "Campaign Processor Lambda"
+        UI -->|HTTP POST| Proc[SMSCampaignProcessor]
+        Proc -->|list_flows| ListFlows[List Contact Flows]
+        Proc -->|schedule_campaign| Schedule[Schedule Campaign]
+        Proc -->|process_batch| Process[Process Batch]
+        
+        Schedule -->|Parse CSV| CSV[Parse & Validate<br/>Phone Numbers]
+        CSV -->|Filter Active| Filter[Filter Active Sessions<br/>Optional]
+        Filter -->|Store to S3| S3Store[Store Filtered CSV<br/>to S3]
+        S3Store -->|Save Metadata| DDB1[(DynamoDB<br/>SMSCampaigns)]
+        S3Store -->|Schedule Execution| EB[EventBridge<br/>Scheduler]
+    end
+
+    subgraph "Step Functions Orchestrator"
+        EB -->|At Scheduled Time| SF[SMSCampaignOrchestrator<br/>State Machine]
+        SF -->|1. Load CSV| LoadCSV[Load & Parse CSV<br/>from S3]
+        LoadCSV -->|2. Create Batches| Map[Map State<br/>Process Batches<br/>MaxConcurrency: 2]
+        Map -->|50 contacts/batch| Process
+        Map -->|3. Mark Complete| Complete[Mark Campaign<br/>Complete]
+    end
+
+    subgraph "Batch Processing - Switcher Architecture"
+        Process -->|For each contact| Check{Existing<br/>Session?}
+        Check -->|Yes| Term[Terminate Existing<br/>StopContact API]
+        Check -->|No| Create
+        Term -->|Clean up records| Create[Create Chat Contact<br/>StartChatContact]
+        
+        Create -->|1. Start Chat| Chat[Connect Chat Session<br/>No phone number required]
+        Chat -->|2. Start Streaming| Stream[Start Contact Streaming<br/>to SNS Topic]
+        Stream -->|3. Create Connection| Participant[Create Participant<br/>Connection & Credentials]
+        Participant -->|4. Store Session Info| Tables
+    end
+
+    subgraph "Session State Management"
+        Tables -->|Update| Valid[(ValidatedCustomers<br/>DynamoDB)]
+        Tables -->|Create| Sessions[(ConnectChatSessions<br/>DynamoDB)]
+        
+        Valid -.->|phone, language,<br/>chat_status, connectArn,<br/>connectFlowId, etc.| ValidData[Session Metadata]
+        Sessions -.->|contactId, vendorId,<br/>participantId, participantToken,<br/>connectionCredentials| SessionData[Participant Data]
+    end
+
+    subgraph "Connect Flow Execution"
+        Participant -->|Contact routed to| Flow[Connect Contact Flow<br/>Selected by Campaign]
+        Flow -->|Send Message Block| OutSNS[SNS Topic<br/>Outbound Messages]
+    end
+
+    subgraph "Switcher Outbound Handler"
+        OutSNS -->|Trigger| OutLambda[Outbound Lambda<br/>SMS Handler]
+        OutLambda -->|Lookup Session| Sessions
+        OutLambda -->|Send via Pinpoint| EUM[End User Messaging<br/>SendTextMessage]
+        EUM -->|Origination: 211211| Short[211211 Shortcode]
+        Short -->|SMS Delivery| Customer[Customer Phone]
+    end
+
+    subgraph "Error Handling & Tracking"
+        Process -->|Failed Contacts| FailTrack[Track Failures]
+        FailTrack -->|Store to S3| S3Fail[failed_contacts.json<br/>S3 Bucket]
+        Process -->|Update Stats| DDB1
+        FailTrack -->|Log to CloudWatch| CW[CloudWatch Logs<br/>Detailed Error Info]
+    end
+
+    style UI fill:#e3f2fd
+    style Proc fill:#fff3e0
+    style SF fill:#f3e5f5
+    style Check fill:#ffebee
+    style Create fill:#e8f5e9
+    style Flow fill:#e1f5fe
+    style Short fill:#c8e6c9
+    style Customer fill:#fff9c4
+    style Valid fill:#fce4ec
+    style Sessions fill:#fce4ec
+    style S3Fail fill:#ffccbc
+            </div>
+        </div>
+
+        <h2>Detailed Component Flow</h2>
+        <div class="diagram-wrapper">
+            <div class="mermaid">
+sequenceDiagram
+    participant User
+    participant Lambda as Campaign Processor
+    participant S3
+    participant DDB as DynamoDB
+    participant SF as Step Functions
+    participant Connect
+    participant Participant as Connect Participant
+    participant SNS
+    participant OutLambda as Outbound Handler
+    participant EUM as End User Messaging
+    participant Phone as Customer Phone
+
+    User->>Lambda: Schedule Campaign (CSV + Flow)
+    Lambda->>Lambda: Parse and Validate CSV
+    Lambda->>DDB: Check Active Sessions
+    Lambda->>S3: Store Filtered CSV
+    Lambda->>DDB: Save Campaign Metadata
+    Lambda->>SF: Schedule via EventBridge
+
+    Note over SF: At Scheduled Time
+    SF->>Lambda: Invoke Load CSV
+    Lambda->>S3: Load Campaign CSV
+    Lambda-->>SF: Return Batches
+    
+    loop Each Batch
+        SF->>Lambda: Process Batch
+        
+        loop Each Contact
+            Lambda->>DDB: Check Existing Session
+            Lambda->>Connect: StopContact if needed
+            Lambda->>DDB: Clean Up Old Records
+            Lambda->>Connect: StartChatContact
+            Connect-->>Lambda: ContactId, ParticipantId
+            Lambda->>Connect: StartContactStreaming
+            Lambda->>Participant: CreateParticipantConnection
+            Participant-->>Lambda: Connection Credentials
+            Lambda->>DDB: Update ValidatedCustomers
+            Lambda->>DDB: Create ConnectChatSessions
+            Connect->>Connect: Execute Contact Flow
+            Connect->>SNS: Send Message Event
+            SNS->>OutLambda: Trigger with Message
+            OutLambda->>DDB: Lookup Session Data
+            OutLambda->>EUM: SendTextMessage from 211211
+            EUM->>Phone: SMS Delivery
+        end
+        
+        Lambda->>S3: Store Failed Contacts
+        Lambda->>DDB: Update Campaign Stats
+    end
+    
+    SF->>Lambda: Mark Campaign Complete
+    Lambda->>DDB: Update Status to COMPLETED
+            </div>
+        </div>
+
+        <div class="key-features">
+            <h3>Key Architectural Features</h3>
+            <ul>
+                <li><strong>Switcher Architecture Integration:</strong> Uses StartChatContact (not StartOutboundChatContact) to enable 211211 shortcode messaging</li>
+                <li><strong>No Phone Number ARN Required:</strong> Chat-based contacts don't need a Connect-registered phone number</li>
+                <li><strong>Proper Session Management:</strong> Updates both ValidatedCustomers and ConnectChatSessions tables with full participant data</li>
+                <li><strong>Conflict Resolution:</strong> Automatically terminates existing sessions before creating new ones</li>
+                <li><strong>Rate Limit Handling:</strong> Exponential backoff retry logic for Connect API rate limits (50 TPS)</li>
+                <li><strong>Batch Processing:</strong> Step Functions Map state with MaxConcurrency: 2 to prevent overwhelming Connect API</li>
+                <li><strong>Active Session Filtering:</strong> Optional pre-campaign filtering to skip contacts already in flows</li>
+                <li><strong>Failed Contact Tracking:</strong> Stores failed phone numbers with error details in S3 for retry campaigns</li>
+                <li><strong>All Messages from 211211:</strong> Complete integration with Switcher's outbound handler ensures consistent shortcode usage</li>
+            </ul>
+        </div>
+
+        <div class="note">
+            <strong>Note:</strong> This architecture replaces the previous StartOutboundChatContact approach, which required a Connect-registered phone number. The new Switcher-based approach creates chat sessions that route through the existing SMS infrastructure, enabling seamless 211211 shortcode messaging for all campaign communications.
+        </div>
+
+        <h2>Data Tables Schema</h2>
+        <div class="diagram-wrapper">
+            <div class="mermaid">
+erDiagram
+    SMSCampaigns {
+        string campaignId
+        number timestamp
+        string flowArn
+        string scheduledTime
+        number totalContacts
+        number skippedContacts
+        string status
+        string s3Key
+        number successfulContacts
+        number failedContacts
+    }
+
+    ValidatedCustomers {
+        string phone
+        string language
+        string chat_status
+        number expiration
+        string connectArn
+        string connectFlowId
+        string connectInstance
+        string history
+    }
+
+    ConnectChatSessions {
+        string contactId
+        string vendorId
+        string channel
+        string participantId
+        string participantToken
+        string datetime
+        number expiration
+        string previousContactId
+        string nextContactId
+    }
+
+    FailedContacts {
+        string phoneNumber
+        string error
+        string timestamp
+    }
+
+    SMSCampaigns ||--o{ FailedContacts : tracks
+    SMSCampaigns ||--o{ ValidatedCustomers : updates
+    ValidatedCustomers ||--|| ConnectChatSessions : links
+            </div>
+        </div>
+
+        <h2>Technology Stack</h2>
+        <div class="key-features">
+            <ul>
+                <li><strong>Lambda Runtime:</strong> Python 3.13</li>
+                <li><strong>AWS Services:</strong> Lambda, Step Functions, EventBridge Scheduler, S3, DynamoDB, Connect, ConnectParticipant, End User Messaging (Pinpoint SMS Voice V2)</li>
+                <li><strong>Orchestration:</strong> AWS Step Functions with Map state (MaxConcurrency: 2)</li>
+                <li><strong>Storage:</strong> S3 (CSVs, failed contacts), DynamoDB (campaigns, sessions, customer data)</li>
+                <li><strong>Messaging:</strong> 211211 shortcode via End User Messaging</li>
+                <li><strong>Session Management:</strong> 7-day TTL on session records</li>
+                <li><strong>Batch Size:</strong> 50 contacts per batch</li>
+                <li><strong>Rate Limiting:</strong> Connect StartChatContact: 50 TPS, EUM SendTextMessage: 100 TPS</li>
+            </ul>
+        </div>
+
+    </div>
+
+    <script>
+        mermaid.initialize({ 
+            startOnLoad: true,
+            theme: 'default',
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis'
+            },
+            sequence: {
+                useMaxWidth: true,
+                wrap: true
+            }
+        });
+    </script>
+</body>
+</html>
